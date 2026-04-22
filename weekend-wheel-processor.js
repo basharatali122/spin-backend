@@ -1,41 +1,40 @@
+
+
 // /**
-//  * weekend-wheel-processor.js
+//  * weekend-wheel-processor.js  —  HIGH THROUGHPUT EDITION
 //  *
-//  * Handles BOTH regular + weekend wheel spins per account (double spin mode).
+//  * Same architecture as regular-wheel-processor (continuous worker pool)
+//  * plus the full regular+weekend spin state machine.
 //  *
-//  * Verified flow from actual browser captures:
-//  *
-//  *  1. Login
-//  *     SEND:  { account, password, version:'2.0.1', mainID:100, subID:6 }
-//  *     RECV:  { mainID:100, subID:116, data:{ userid, dynamicpass, bossid, score, ... } }
-//  *
-//  *  2. Check availability
-//  *     SEND:  { userid, password, mainID:100, subID:26 }
-//  *     RECV:  { mainID:100, subID:142, data:{ blottery, blotteryhappyweek, dynamicpass, score } }
-//  *            blottery === 1          → regular spin available
-//  *            blotteryhappyweek === 1 → weekend spin available
-//  *
-//  *  3a. Spin regular wheel (if blottery === 1)
-//  *     SEND:  { userid, dynamicpass, mainID:100, subID:16 }
-//  *     RECV:  { mainID:100, subID:131, data:{ result, lotteryscore, score } }
-//  *
-//  *  4.  Re-check availability after regular spin
-//  *     SEND:  { userid, password, mainID:100, subID:26 }
-//  *     RECV:  subID:142 again — check blotteryhappyweek
-//  *
-//  *  3b. Spin weekend wheel (if blotteryhappyweek === 1)
-//  *     SEND:  { userid, dynamicpass, mainID:100, subID:27 }
-//  *     RECV:  { mainID:100, subID:143, data:{ result, lotteryscore, score } }
-//  *
-//  * Notes:
-//  *  - MegaSpin / OrionStars: noWeekendSpin=true → skip weekend, treat as single spin
-//  *  - LOGIN_WS_URL and ORIGIN are overwritten at runtime by the game selector
-//  *  - All responses are nested under msg.data — always read from there
+//  * PandaMaster IP ban handling is identical to regular-wheel-processor.
+//  * The bannedIpCache is shared between both processors (module-level).
 //  */
 
 // const WebSocket    = require('ws');
 // const EventEmitter = require('events');
 // const { makeProxyAgent, ProxyRotator } = require('./proxyUtils');
+
+// // Shared with regular-wheel-processor if both are loaded in the same process
+// const bannedIpCache  = new Map();
+// const BAN_COOLDOWN_MS = 10 * 60 * 1000;
+
+// function recordBannedIp(ip) {
+//   if (ip) bannedIpCache.set(ip, Date.now());
+// }
+
+// function isIpBanned(ip) {
+//   if (!ip) return false;
+//   const t = bannedIpCache.get(ip);
+//   if (!t) return false;
+//   if (Date.now() - t > BAN_COOLDOWN_MS) { bannedIpCache.delete(ip); return false; }
+//   return true;
+// }
+
+// function extractBannedIp(msg) {
+//   if (!msg) return null;
+//   const m = String(msg).match(/\((\d+\.\d+\.\d+\.\d+)\)/);
+//   return m ? m[1] : null;
+// }
 
 // class WeekendWheelProcessor extends EventEmitter {
 //   constructor(db) {
@@ -43,44 +42,39 @@
 //     this.db              = db;
 //     this.isProcessing    = false;
 //     this.currentAccounts = [];
-//     this.processingIndex = 0;
-//     this.activeProcesses = new Map();
-
-//     this.totalCycles  = 1;
-//     this.currentCycle = 0;
-
-//     // noWeekendSpin is set at runtime from gameConfig.noWeekendSpin
-//     this.noWeekendSpin = false;
-
-//     // Proxy rotator — populated in startProcessing()
-//     this.proxyRotator = new ProxyRotator([]);
+//     this.proxyRotator    = new ProxyRotator([]);
+//     this.instanceId      = 'default';
+//     this.noWeekendSpin   = false;
+//     this.totalCycles     = 1;
+//     this.currentCycle    = 0;
 
 //     this.stats = {
 //       successCount:      0,
 //       failCount:         0,
+//       ipBanned:          0,
 //       regularWheelSpins: 0,
 //       weekendWheelSpins: 0,
 //       totalScoreWon:     0,
 //       activeWorkers:     0,
 //       cyclesCompleted:   0,
+//       processed:         0,
 //     };
 
 //     this.config = {
-//       // Overwritten at runtime by game selector via processing route
-//       LOGIN_WS_URL:  'wss://pandamaster.vip:7878/',
-//       GAME_VERSION:  '2.0.1',
-//       ORIGIN:        'http://play.pandamaster.vip',
+//       LOGIN_WS_URL:   'wss://pandamaster.vip:7878/',
+//       GAME_VERSION:   '2.0.1',
+//       ORIGIN:         'http://play.pandamaster.vip',
 
-//       BATCH_SIZE:    5,
-//       BATCH_DELAY_MS: 1200,
-//       RETRY_ATTEMPTS: 2,
-//       RANDOM_DELAYS: { MIN: 800, MAX: 3000 },
-//       CYCLE_DELAY:   { MIN: 3000, MAX: 8000 },
+//       WORKERS:        20,
+//       STAGGER_MS:     150,
+//       RETRY_ATTEMPTS: 1,
+
 //       TIMEOUTS: {
-//         TOTAL:       50000,  // hard per-account timeout
-//         LOGIN:       15000,
-//         WHEEL_SPIN:  20000,
+//         TOTAL: 45000,
+//         WS:    12000,
 //       },
+
+//       CYCLE_DELAY: { MIN: 2000, MAX: 5000 },
 //     };
 
 //     this.mobileUserAgents = [
@@ -88,6 +82,7 @@
 //       'Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
 //       'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1',
 //       'Mozilla/5.0 (Linux; Android 13; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36',
+//       'Mozilla/5.0 (Linux; Android 14; SM-A546B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
 //     ];
 //   }
 
@@ -96,47 +91,41 @@
 //   async startProcessing(accountIds, repetitions = 1, useProxy = false, proxyList = []) {
 //     if (this.isProcessing) throw new Error('Already processing');
 
-//     this.isProcessing    = true;
-//     this.processingIndex = 0;
-//     this.activeProcesses.clear();
-//     this.totalCycles  = Math.max(1, Math.min(100, parseInt(repetitions) || 1));
-//     this.currentCycle = 0;
+//     this.isProcessing  = true;
+//     this.totalCycles   = Math.max(1, Math.min(100, parseInt(repetitions) || 1));
+//     this.currentCycle  = 0;
 
 //     this.stats = {
-//       successCount: 0, failCount: 0,
+//       successCount: 0, failCount: 0, ipBanned: 0,
 //       regularWheelSpins: 0, weekendWheelSpins: 0,
-//       totalScoreWon: 0, activeWorkers: 0, cyclesCompleted: 0,
+//       totalScoreWon: 0, activeWorkers: 0, cyclesCompleted: 0, processed: 0,
 //     };
 
-//     // Init proxy rotator with provided list (all formats auto-normalized)
 //     this.proxyRotator = new ProxyRotator(proxyList);
+
+//     const workerCount = (useProxy && proxyList.length > 0)
+//       ? Math.min(this.config.WORKERS, proxyList.length)
+//       : this.config.WORKERS;
 
 //     const all = await this.db.getAllAccounts();
 //     this.currentAccounts = all.filter(a => accountIds.includes(a.id));
 
-//     const spinMode = this.noWeekendSpin
-//       ? 'Regular only (game has no weekend wheel)'
-//       : 'Regular + Weekend wheel per account';
-
+//     const spinMode = this.noWeekendSpin ? 'Regular only' : 'Regular + Weekend';
 //     this._emit('terminal', { type: 'info', message: `🚀 WEEKEND WHEEL SPIN BOT STARTED` });
 //     this._emit('terminal', { type: 'info', message: `📋 Accounts: ${this.currentAccounts.length} | Cycles: ${this.totalCycles}` });
+//     this._emit('terminal', { type: 'info', message: `⚡ Workers: ${workerCount} concurrent` });
 //     this._emit('terminal', { type: 'info', message: `🎯 Strategy: ${spinMode}` });
 //     this._emit('terminal', { type: 'info', message: `🌐 Login: ${this.config.LOGIN_WS_URL}` });
 //     this._emit('terminal', { type: 'info', message: `🔗 Origin: ${this.config.ORIGIN}` });
-//     this._emit('terminal', { type: 'info', message: `🛡️ Proxy: ${this.proxyRotator.enabled ? this.proxyRotator.summary() : 'disabled (direct connection)'}` });
-//     this._emit('status', {
-//       running: true, total: this.currentAccounts.length,
-//       current: 0, activeWorkers: 0,
-//       currentCycle: 0, totalCycles: this.totalCycles,
-//     });
+//     this._emit('terminal', { type: 'info', message: `🛡️ Proxy: ${this.proxyRotator.enabled ? this.proxyRotator.summary() : 'disabled (direct)'}` });
+//     this._emit('status', { running: true, total: this.currentAccounts.length, current: 0, activeWorkers: 0, currentCycle: 0, totalCycles: this.totalCycles });
 
-//     this._runCycles();
+//     this._runCycles(workerCount);
 //     return { started: true, totalAccounts: this.currentAccounts.length, totalCycles: this.totalCycles };
 //   }
 
 //   async stopProcessing() {
 //     this.isProcessing = false;
-//     this.activeProcesses.clear();
 //     this._emit('terminal', { type: 'warning', message: '🛑 Processing stopped by user' });
 //     this._emit('status', { running: false, activeWorkers: 0 });
 //     return { success: true };
@@ -144,158 +133,154 @@
 
 //   // ── Cycle loop ──────────────────────────────────────────────────────────────
 
-//   async _runCycles() {
+//   async _runCycles(workerCount) {
 //     while (this.isProcessing && this.currentCycle < this.totalCycles) {
 //       this.currentCycle++;
-//       this.processingIndex = 0;
+//       this.stats.processed = 0;
 
 //       const sep = '─'.repeat(55);
-//       this._emit('terminal', { type: 'info',
-//         message: `\n${sep}\n🔄 CYCLE ${this.currentCycle}/${this.totalCycles}\n${sep}` });
+//       this._emit('terminal', { type: 'info', message: `\n${sep}\n🔄 CYCLE ${this.currentCycle}/${this.totalCycles}\n${sep}` });
+//       this._emit('cycleStart', { cycle: this.currentCycle, totalCycles: this.totalCycles, accountCount: this.currentAccounts.length });
 
-//       this._emit('cycleStart', {
-//         cycle: this.currentCycle, totalCycles: this.totalCycles,
-//         accountCount: this.currentAccounts.length,
-//       });
-
-//       await this._processBatches();
+//       await this._runWorkerPool(workerCount);
 
 //       this.stats.cyclesCompleted = this.currentCycle;
-//       this._emit('cycleUpdate', {
-//         cyclesCompleted:   this.currentCycle,
-//         totalCycles:       this.totalCycles,
-//         successCount:      this.stats.successCount,
-//         failCount:         this.stats.failCount,
-//         regularWheelSpins: this.stats.regularWheelSpins,
-//         weekendWheelSpins: this.stats.weekendWheelSpins,
-//         totalScoreWon:     this.stats.totalScoreWon,
-//       });
+//       this._emit('cycleUpdate', { ...this.stats, cyclesCompleted: this.currentCycle, totalCycles: this.totalCycles });
 //       this._emit('terminal', { type: 'success',
 //         message: `✅ Cycle ${this.currentCycle} done | Regular: ${this.stats.regularWheelSpins} | Weekend: ${this.stats.weekendWheelSpins} | Score: ${this.stats.totalScoreWon}` });
 
 //       if (this.isProcessing && this.currentCycle < this.totalCycles) {
 //         const delay = this._rand(this.config.CYCLE_DELAY.MIN, this.config.CYCLE_DELAY.MAX);
-//         this._emit('terminal', { type: 'info', message: `⏳ Waiting ${delay}ms before next cycle...` });
+//         this._emit('terminal', { type: 'info', message: `⏳ Next cycle in ${delay}ms...` });
 //         await this._sleep(delay);
 //       }
 //     }
 //     this._complete();
 //   }
 
-//   // ── Batch loop ──────────────────────────────────────────────────────────────
+//   // ── Continuous worker pool ──────────────────────────────────────────────────
 
-//   async _processBatches() {
-//     const total = this.currentAccounts.length;
-//     while (this.isProcessing && this.processingIndex < total) {
-//       const start = this.processingIndex;
-//       const end   = Math.min(start + this.config.BATCH_SIZE, total);
-//       const batch = this.currentAccounts.slice(start, end);
+//   async _runWorkerPool(workerCount) {
+//     const queue   = [...this.currentAccounts];
+//     let   queueIdx = 0;
+//     const total   = queue.length;
 
-//       this._emit('terminal', { type: 'info',
-//         message: `🔄 Batch ${Math.floor(start / this.config.BATCH_SIZE) + 1}: Accounts ${start + 1}–${end}` });
+//     const getNext = () => {
+//       if (queueIdx >= total) return null;
+//       return { account: queue[queueIdx], index: queueIdx++ };
+//     };
 
-//       await Promise.allSettled(
-//         batch.map((acc, i) => this._processWithRetry(acc, start + i))
-//       );
-//       this.processingIndex = end;
+//     const worker = async () => {
+//       while (this.isProcessing) {
+//         const next = getNext();
+//         if (!next) break;
 
-//       if (this.isProcessing && end < total) {
-//         await this._sleep(this._rand(this.config.RANDOM_DELAYS.MIN, this.config.RANDOM_DELAYS.MAX));
+//         const { account, index } = next;
+//         this.stats.activeWorkers++;
+//         this._emit('status', {
+//           running: true, total, current: index + 1,
+//           activeWorkers: this.stats.activeWorkers,
+//           currentAccount: account.username,
+//           currentCycle: this.currentCycle, totalCycles: this.totalCycles,
+//         });
+
+//         try {
+//           await this._processWithRetry(account, index);
+//         } catch (_) {}
+
+//         this.stats.activeWorkers--;
+//         this.stats.processed++;
+
+//         if (this.stats.processed % 10 === 0) {
+//           this._emit('terminal', {
+//             type: 'info',
+//             message: `📊 [C${this.currentCycle}] ${this.stats.processed}/${total} | ✅ ${this.stats.successCount} | ❌ ${this.stats.failCount} | 🚫 ${this.stats.ipBanned} | Workers: ${this.stats.activeWorkers}`,
+//           });
+//         }
 //       }
+//     };
+
+//     const workers = [];
+//     for (let i = 0; i < workerCount; i++) {
+//       await this._sleep(this.config.STAGGER_MS);
+//       if (!this.isProcessing) break;
+//       workers.push(worker());
 //     }
+
+//     await Promise.allSettled(workers);
 //   }
 
 //   // ── Retry wrapper ───────────────────────────────────────────────────────────
 
 //   async _processWithRetry(account, globalIndex, attempt = 0) {
-//     this.stats.activeWorkers++;
-//     this._emit('status', {
-//       running: true, total: this.currentAccounts.length,
-//       current: globalIndex + 1, activeWorkers: this.stats.activeWorkers,
-//       currentAccount: account.username,
-//       currentCycle: this.currentCycle, totalCycles: this.totalCycles,
-//     });
+//     const result = await this._accountFlow(account, globalIndex, attempt);
 
-//     try {
-//       const result = await this._accountFlow(account, globalIndex, attempt);
-
-//       if (!result.success && attempt < this.config.RETRY_ATTEMPTS) {
-//         this._log(globalIndex, 'warning', `🔄 Retry ${attempt + 1}/${this.config.RETRY_ATTEMPTS}`);
-//         await this._sleep(this._rand(this.config.RANDOM_DELAYS.MIN, this.config.RANDOM_DELAYS.MAX));
-//         return this._processWithRetry(account, globalIndex, attempt + 1);
-//       }
-
-//       if (result.newScore !== undefined) {
-//         await this.db.updateAccount({ ...account, score: result.newScore });
-//       }
-//       await this.db.addProcessingLog(
-//         account.id,
-//         result.success ? 'success' : 'error',
-//         result.success
-//           ? `Regular:${result.regularSpun ? '✓' : '✗'} Weekend:${result.weekendSpun ? '✓' : '✗'} +${result.totalScoreWon}`
-//           : result.error,
-//         result
-//       );
-
-//       if (result.success) {
-//         this.stats.successCount++;
-//         if (result.regularSpun)  this.stats.regularWheelSpins++;
-//         if (result.weekendSpun)  this.stats.weekendWheelSpins++;
-//         if (result.totalScoreWon) this.stats.totalScoreWon += result.totalScoreWon;
-//       } else {
-//         this.stats.failCount++;
-//       }
-
-//       this._emit('progress', {
-//         index: globalIndex, total: this.currentAccounts.length,
-//         account: account.username, success: result.success,
-//         stats: { ...this.stats },
-//       });
-//       this._emit('wheelStats', { ...this.stats });
-
-//       return result;
-
-//     } catch (err) {
-//       this._log(globalIndex, 'error', `❌ Error: ${err.message}`);
-//       this.stats.failCount++;
-//       return { success: false, error: err.message };
-//     } finally {
-//       this.stats.activeWorkers--;
+//     if (result.newScore !== undefined) {
+//       await this.db.updateAccount({ ...account, score: result.newScore });
 //     }
+//     await this.db.addProcessingLog(
+//       account.id,
+//       result.success ? 'success' : (result.ipBanned ? 'ip_banned' : 'error'),
+//       result.success
+//         ? `R:${result.regularSpun ? '✓' : '✗'} W:${result.weekendSpun ? '✓' : '✗'} +${result.totalScoreWon || 0}`
+//         : result.error,
+//       result
+//     );
+
+//     if (result.ipBanned || result.serverRejected) {
+//       if (result.ipBanned) this.stats.ipBanned++;
+//       else this.stats.failCount++;
+//       return result;
+//     }
+
+//     if (!result.success && attempt < this.config.RETRY_ATTEMPTS) {
+//       this._log(globalIndex, 'warning', `🔄 Retry ${attempt + 1}/${this.config.RETRY_ATTEMPTS}`);
+//       await this._sleep(this._rand(500, 1200));
+//       return this._processWithRetry(account, globalIndex, attempt + 1);
+//     }
+
+//     if (result.success) {
+//       this.stats.successCount++;
+//       if (result.regularSpun)   this.stats.regularWheelSpins++;
+//       if (result.weekendSpun)   this.stats.weekendWheelSpins++;
+//       if (result.totalScoreWon) this.stats.totalScoreWon += result.totalScoreWon;
+//     } else {
+//       this.stats.failCount++;
+//     }
+
+//     this._emit('progress', {
+//       index: globalIndex, total: this.currentAccounts.length,
+//       account: account.username, success: result.success,
+//       stats: { ...this.stats },
+//     });
+//     this._emit('wheelStats', { ...this.stats });
+
+//     return result;
 //   }
 
 //   // ── Core account flow ───────────────────────────────────────────────────────
 
 //   _accountFlow(account, index, attempt = 0) {
 //     return new Promise(async (resolve) => {
-//       let ws = null;
+//       let ws    = null;
+//       let phase = 'login';
 
-//       // State machine:
-//       // login → check → spin_regular → check_weekend → spin_weekend → done
-//       let phase         = 'login';
 //       let loginDone     = false;
 //       let regularSpun   = false;
 //       let weekendSpun   = false;
 //       let totalScoreWon = 0;
 //       let lastScore     = account.score || 0;
 
-//       this._log(index, 'info',
-//         `🔄 ${account.username}${attempt > 0 ? ` (retry ${attempt})` : ''}`);
+//       this._log(index, 'info', `🔄 ${account.username}${attempt > 0 ? ` (retry ${attempt})` : ''}`);
 
-//       // Hard timeout
 //       const hardTimeout = setTimeout(() => {
-//         this._log(index, 'warning', `⏰ Hard timeout — resolving`);
 //         cleanup();
 //         resolve({ success: regularSpun || weekendSpun, regularSpun, weekendSpun, totalScoreWon, newScore: lastScore, error: 'Timeout' });
 //       }, this.config.TIMEOUTS.TOTAL);
 
 //       const cleanup = () => {
 //         clearTimeout(hardTimeout);
-//         try {
-//           if (ws && ws.readyState !== WebSocket.CLOSED && ws.readyState !== WebSocket.CLOSING) {
-//             ws.terminate();
-//           }
-//         } catch (_) {}
+//         try { if (ws && ws.readyState <= 1) ws.terminate(); } catch (_) {}
 //       };
 
 //       const done = (result) => {
@@ -305,33 +290,49 @@
 //         resolve(result);
 //       };
 
-//       // Get proxy agent for this account
+//       // ── Proxy selection (same logic as regular processor) ──────────────────
 //       let agent = null;
+
 //       if (this.proxyRotator.enabled) {
 //         const proxyUrl = this.proxyRotator.next();
-//         try {
-//           agent = await makeProxyAgent(proxyUrl);
-//           if (agent) {
-//             this._log(index, 'debug', `🛡️ Proxy: ${proxyUrl.replace(/\/\/[^@]+@/, '//*:****@')}`);
-//           } else {
-//             this._log(index, 'warning', `⚠️ Proxy agent failed, using direct`);
+//         if (proxyUrl) {
+//           try {
+//             const u = new URL(proxyUrl);
+//             const proxyIp = u.hostname;
+
+//             if (isIpBanned(proxyIp)) {
+//               let found = false;
+//               for (let t = 0; t < 5; t++) {
+//                 const alt = this.proxyRotator.next();
+//                 if (!alt) break;
+//                 const au = new URL(alt);
+//                 if (!isIpBanned(au.hostname)) {
+//                   try {
+//                     agent = await makeProxyAgent(alt);
+//                     if (agent) {
+//                       this._log(index, 'debug', `🛡️ Alt proxy: ${alt.replace(/\/\/[^@]+@/, '//*:****@')}`);
+//                       found = true; break;
+//                     }
+//                   } catch (_) {}
+//                 }
+//               }
+//               if (!found) this._log(index, 'warning', `⚠️ All tried proxies banned — using direct`);
+//             } else {
+//               agent = await makeProxyAgent(proxyUrl);
+//               if (agent) this._log(index, 'debug', `🛡️ Proxy: ${proxyUrl.replace(/\/\/[^@]+@/, '//*:****@')}`);
+//             }
+//           } catch (_) {
+//             try { agent = await makeProxyAgent(proxyUrl); } catch (_) {}
 //           }
-//         } catch (err) {
-//           this._log(index, 'warning', `⚠️ Proxy error: ${err.message} — using direct`);
 //         }
 //       }
 
-//       // Build WS options
 //       const wsOptions = {
-//         handshakeTimeout: 12000,
-//         headers: {
-//           'User-Agent': this._userAgent(),
-//           'Origin':     this.config.ORIGIN,
-//         },
+//         handshakeTimeout: this.config.TIMEOUTS.WS,
+//         headers: { 'User-Agent': this._userAgent(), 'Origin': this.config.ORIGIN },
 //       };
 //       if (agent) wsOptions.agent = agent;
 
-//       // Open WebSocket with correct origin
 //       try {
 //         ws = new WebSocket(this.config.LOGIN_WS_URL, ['wl'], wsOptions);
 //       } catch (err) {
@@ -340,31 +341,33 @@
 
 //       ws.on('open', () => {
 //         this._log(index, 'success', `✅ Connected`);
-//         // Step 1 — Login
 //         ws.send(JSON.stringify({
-//           account:  account.username,
-//           password: account.password,
-//           version:  this.config.GAME_VERSION,
-//           mainID:   100,
-//           subID:    6,
+//           account: account.username, password: account.password,
+//           version: this.config.GAME_VERSION, mainID: 100, subID: 6,
 //         }));
 //       });
 
 //       ws.on('message', (raw) => {
 //         if (phase === 'done') return;
-
 //         let msg;
 //         try { msg = JSON.parse(raw.toString()); } catch (_) { return; }
-
 //         this._log(index, 'debug', `📩 mainID:${msg.mainID} subID:${msg.subID} phase:${phase}`);
 
-//         // ── Login response — subID:116 ───────────────────────────────────────
+//         // ── Login (subID:116) ───────────────────────────────────────────────
 //         if (msg.subID === 116 && !loginDone) {
 //           const d = msg.data || {};
 
+//           if (d.result === -1) {
+//             const bannedIp = extractBannedIp(d.msg);
+//             if (bannedIp) recordBannedIp(bannedIp);
+//             this._log(index, 'error', `❌ IP BANNED: ${d.msg}`);
+//             return done({ success: false, ipBanned: true, bannedIp, error: d.msg, regularSpun, weekendSpun, totalScoreWon });
+//           }
+
 //           if (!d.userid || !d.dynamicpass) {
+//             const serverRejected = d.result === 3 || d.result === 2;
 //             this._log(index, 'error', `❌ Login failed — result=${d.result} msg="${d.msg || ''}"`);
-//             return done({ success: false, error: `Login rejected (result:${d.result})`, regularSpun, weekendSpun, totalScoreWon });
+//             return done({ success: false, serverRejected, error: `Login rejected (result:${d.result})`, regularSpun, weekendSpun, totalScoreWon });
 //           }
 
 //           account.userid      = d.userid;
@@ -374,141 +377,94 @@
 //           loginDone           = true;
 //           this._log(index, 'success', `✅ Logged in: ${d.nickname || account.username} | score: ${lastScore}`);
 
-//           // Step 2 — Check wheel availability
 //           phase = 'check';
-//           ws.send(JSON.stringify({
-//             userid:   account.userid,
-//             password: account.password,
-//             mainID:   100,
-//             subID:    26,
-//           }));
+//           ws.send(JSON.stringify({ userid: account.userid, password: account.password, mainID: 100, subID: 26 }));
 //           return;
 //         }
 
-//         // ── Availability response — subID:142 ────────────────────────────────
+//         // ── Availability (subID:142) ────────────────────────────────────────
 //         if (msg.subID === 142) {
 //           const d = msg.data || {};
-
-//           // Always refresh dynamicpass — the server can rotate it
 //           if (d.dynamicpass) account.dynamicpass = d.dynamicpass;
 //           if (d.score !== undefined) lastScore = d.score;
 
 //           const regularAvail = d.blottery === 1;
 //           const weekendAvail = d.blotteryhappyweek === 1;
+//           this._log(index, 'info', `🎡 Regular:${regularAvail} Weekend:${weekendAvail} [${phase}]`);
 
-//           this._log(index, 'info',
-//             `🎡 Regular:${regularAvail} Weekend:${weekendAvail} [phase:${phase}] noWeekend:${this.noWeekendSpin}`);
-
-//           // ── PHASE: initial check ─────────────────────────────────────────
 //           if (phase === 'check') {
 //             if (regularAvail) {
 //               phase = 'spin_regular';
-//               this._log(index, 'info', `🎡 Spinning regular wheel...`);
-//               ws.send(JSON.stringify({
-//                 userid:      account.userid,
-//                 dynamicpass: account.dynamicpass,
-//                 mainID:      100,
-//                 subID:       16,
-//               }));
+//               ws.send(JSON.stringify({ userid: account.userid, dynamicpass: account.dynamicpass, mainID: 100, subID: 16 }));
 //             } else if (!this.noWeekendSpin && weekendAvail) {
-//               // Regular already used today — go straight to weekend
 //               phase = 'spin_weekend';
-//               this._log(index, 'info', `🎡 Regular done, spinning weekend wheel directly...`);
-//               ws.send(JSON.stringify({
-//                 userid:      account.userid,
-//                 dynamicpass: account.dynamicpass,
-//                 mainID:      100,
-//                 subID:       27,
-//               }));
+//               ws.send(JSON.stringify({ userid: account.userid, dynamicpass: account.dynamicpass, mainID: 100, subID: 27 }));
 //             } else {
 //               this._log(index, 'warning', `⚠️ No wheels available`);
-//               return done({ success: true, regularSpun, weekendSpun, totalScoreWon, newScore: lastScore, message: 'No wheels available' });
+//               return done({ success: true, regularSpun, weekendSpun, totalScoreWon, newScore: lastScore, message: 'No wheels' });
 //             }
 //             return;
 //           }
 
-//           // ── PHASE: re-check after regular spin ───────────────────────────
 //           if (phase === 'check_weekend') {
 //             if (!this.noWeekendSpin && weekendAvail) {
 //               phase = 'spin_weekend';
-//               this._log(index, 'info', `🎡 Spinning weekend wheel...`);
-//               ws.send(JSON.stringify({
-//                 userid:      account.userid,
-//                 dynamicpass: account.dynamicpass,
-//                 mainID:      100,
-//                 subID:       27,
-//               }));
+//               ws.send(JSON.stringify({ userid: account.userid, dynamicpass: account.dynamicpass, mainID: 100, subID: 27 }));
 //             } else {
-//               this._log(index, 'info', `✅ Regular done, weekend not available${this.noWeekendSpin ? ' (game has no weekend wheel)' : ''}`);
 //               return done({ success: true, regularSpun, weekendSpun, totalScoreWon, newScore: lastScore });
 //             }
 //             return;
 //           }
-
-//           return; // ignore 142 in other phases
+//           return;
 //         }
 
-//         // ── Regular wheel result — subID:131 ─────────────────────────────────
+//         // ── Regular spin result (subID:131) ────────────────────────────────
 //         if (msg.subID === 131 && phase === 'spin_regular') {
 //           const d = msg.data || {};
 //           regularSpun = true;
 //           const won = d.lotteryscore || 0;
-//           lastScore   = d.score !== undefined ? d.score : lastScore;
+//           lastScore     = d.score !== undefined ? d.score : lastScore;
 //           totalScoreWon += won;
 
-//           if (d.result === 0) {
-//             this._log(index, 'success', `🎉 Regular spin: +${won} pts → balance: ${lastScore}`);
-//           } else {
-//             this._log(index, 'warning', `⚠️ Regular spin result=${d.result} (msg:${d.msg || ''})`);
-//           }
+//           if (d.result === 0) this._log(index, 'success', `🎉 Regular: +${won} → ${lastScore}`);
+//           else this._log(index, 'warning', `⚠️ Regular result=${d.result}`);
 
-//           // If game has no weekend spin → done
 //           if (this.noWeekendSpin) {
-//             return setTimeout(() => done({ success: true, regularSpun, weekendSpun, totalScoreWon, newScore: lastScore }), 400);
+//             return setTimeout(() => done({ success: true, regularSpun, weekendSpun, totalScoreWon, newScore: lastScore }), 300);
 //           }
 
-//           // Re-check availability for weekend wheel
 //           phase = 'check_weekend';
 //           setTimeout(() => {
 //             if (ws && ws.readyState === WebSocket.OPEN && phase !== 'done') {
-//               ws.send(JSON.stringify({
-//                 userid:   account.userid,
-//                 password: account.password,
-//                 mainID:   100,
-//                 subID:    26,
-//               }));
+//               ws.send(JSON.stringify({ userid: account.userid, password: account.password, mainID: 100, subID: 26 }));
 //             }
-//           }, 600);
+//           }, 500);
 //           return;
 //         }
 
-//         // ── Weekend wheel result — subID:143 ─────────────────────────────────
+//         // ── Weekend spin result (subID:143) ────────────────────────────────
 //         if (msg.subID === 143 && phase === 'spin_weekend') {
 //           const d = msg.data || {};
 //           weekendSpun = true;
 //           const won = d.lotteryscore || 0;
-//           lastScore   = d.score !== undefined ? d.score : lastScore;
+//           lastScore     = d.score !== undefined ? d.score : lastScore;
 //           totalScoreWon += won;
 
-//           if (d.result === 0) {
-//             this._log(index, 'success', `🎉 Weekend spin: +${won} pts → balance: ${lastScore}`);
-//           } else {
-//             this._log(index, 'warning', `⚠️ Weekend spin result=${d.result}`);
-//           }
+//           if (d.result === 0) this._log(index, 'success', `🎉 Weekend: +${won} → ${lastScore}`);
+//           else this._log(index, 'warning', `⚠️ Weekend result=${d.result}`);
 
-//           setTimeout(() => done({ success: true, regularSpun, weekendSpun, totalScoreWon, newScore: lastScore }), 400);
+//           setTimeout(() => done({ success: true, regularSpun, weekendSpun, totalScoreWon, newScore: lastScore }), 300);
 //           return;
 //         }
 //       });
 
 //       ws.on('error', (err) => {
 //         this._log(index, 'error', `❌ WS error: ${err.message}`);
-//         done({ success: false, error: err.message, regularSpun, weekendSpun, totalScoreWon });
+//         done({ success: false, error: err.message, regularSpun, weekendSpun, totalScoreWon, newScore: lastScore });
 //       });
 
 //       ws.on('close', (code) => {
 //         if (phase !== 'done') {
-//           this._log(index, 'debug', `WS closed (code:${code}) while phase=${phase}`);
 //           done({ success: regularSpun || weekendSpun, regularSpun, weekendSpun, totalScoreWon, newScore: lastScore });
 //         }
 //       });
@@ -519,10 +475,9 @@
 
 //   _complete() {
 //     this.isProcessing = false;
-//     this._emit('terminal', { type: 'success', message: '\n🎉 ALL PROCESSING COMPLETED!' });
-//     this._emit('terminal', { type: 'info',    message: `📈 Success: ${this.stats.successCount} | Failed: ${this.stats.failCount}` });
-//     this._emit('terminal', { type: 'info',    message: `🎡 Regular spins: ${this.stats.regularWheelSpins} | Weekend spins: ${this.stats.weekendWheelSpins}` });
-//     this._emit('terminal', { type: 'info',    message: `💰 Total score won: ${this.stats.totalScoreWon}` });
+//     this._emit('terminal', { type: 'success', message: `\n🎉 ALL PROCESSING COMPLETED!` });
+//     this._emit('terminal', { type: 'info',    message: `📈 Success: ${this.stats.successCount} | Failed: ${this.stats.failCount} | IP Banned: ${this.stats.ipBanned}` });
+//     this._emit('terminal', { type: 'info',    message: `🎡 Regular: ${this.stats.regularWheelSpins} | Weekend: ${this.stats.weekendWheelSpins} | Score: ${this.stats.totalScoreWon}` });
 //     this._emit('completed', { ...this.stats });
 //     this._emit('status',   { running: false, activeWorkers: 0 });
 //   }
@@ -544,6 +499,12 @@
 // }
 
 // module.exports = WeekendWheelProcessor;
+
+
+
+
+
+
 
 
 
@@ -613,12 +574,19 @@ class WeekendWheelProcessor extends EventEmitter {
       ORIGIN:         'http://play.pandamaster.vip',
 
       WORKERS:        20,
-      STAGGER_MS:     150,
-      RETRY_ATTEMPTS: 1,
+
+      // FIX: Cap concurrent connections per proxy IP (prevents proxy overload)
+      PER_PROXY_LIMIT: 5,
+
+      // FIX: Stagger increased from 150ms → 500ms to prevent thundering herd
+      STAGGER_MS:     500,
+      RETRY_ATTEMPTS: 3,
+      // FIX: Exponential backoff between retries (ms)
+      RETRY_BACKOFF: [1000, 3000, 8000],
 
       TIMEOUTS: {
         TOTAL: 45000,
-        WS:    12000,
+        WS:    25000,  // FIX: Increased 12s → 25s for slow SOCKS5 handshakes
       },
 
       CYCLE_DELAY: { MIN: 2000, MAX: 5000 },
@@ -648,10 +616,10 @@ class WeekendWheelProcessor extends EventEmitter {
       totalScoreWon: 0, activeWorkers: 0, cyclesCompleted: 0, processed: 0,
     };
 
-    this.proxyRotator = new ProxyRotator(proxyList);
+    this.proxyRotator = new ProxyRotator(proxyList, { maxPerProxy: this.config.PER_PROXY_LIMIT });
 
     const workerCount = (useProxy && proxyList.length > 0)
-      ? Math.min(this.config.WORKERS, proxyList.length)
+      ? Math.min(this.config.WORKERS, proxyList.length * this.config.PER_PROXY_LIMIT)
       : this.config.WORKERS;
 
     const all = await this.db.getAllAccounts();
@@ -781,7 +749,10 @@ class WeekendWheelProcessor extends EventEmitter {
     }
 
     if (!result.success && attempt < this.config.RETRY_ATTEMPTS) {
-      this._log(globalIndex, 'warning', `🔄 Retry ${attempt + 1}/${this.config.RETRY_ATTEMPTS}`);
+        // FIX: Exponential backoff with jitter before retry
+        const backoffMs = (this.config.RETRY_BACKOFF[attempt] || 8000) + Math.floor(Math.random() * 500);
+        this._log(globalIndex, 'warning', `🔄 Retry ${attempt + 1}/${this.config.RETRY_ATTEMPTS} (waiting ${backoffMs}ms)`);
+        await this._sleep(backoffMs);
       await this._sleep(this._rand(500, 1200));
       return this._processWithRetry(account, globalIndex, attempt + 1);
     }
@@ -828,6 +799,7 @@ class WeekendWheelProcessor extends EventEmitter {
       const cleanup = () => {
         clearTimeout(hardTimeout);
         try { if (ws && ws.readyState <= 1) ws.terminate(); } catch (_) {}
+        if (_proxyRelease) { try { _proxyRelease(); } catch (_) {} _proxyRelease = null; }
       };
 
       const done = (result) => {
@@ -839,38 +811,34 @@ class WeekendWheelProcessor extends EventEmitter {
 
       // ── Proxy selection (same logic as regular processor) ──────────────────
       let agent = null;
+      let _proxyRelease = null;
 
       if (this.proxyRotator.enabled) {
-        const proxyUrl = this.proxyRotator.next();
-        if (proxyUrl) {
-          try {
-            const u = new URL(proxyUrl);
-            const proxyIp = u.hostname;
-
-            if (isIpBanned(proxyIp)) {
-              let found = false;
-              for (let t = 0; t < 5; t++) {
-                const alt = this.proxyRotator.next();
-                if (!alt) break;
-                const au = new URL(alt);
-                if (!isIpBanned(au.hostname)) {
-                  try {
-                    agent = await makeProxyAgent(alt);
-                    if (agent) {
-                      this._log(index, 'debug', `🛡️ Alt proxy: ${alt.replace(/\/\/[^@]+@/, '//*:****@')}`);
-                      found = true; break;
-                    }
-                  } catch (_) {}
-                }
-              }
-              if (!found) this._log(index, 'warning', `⚠️ All tried proxies banned — using direct`);
-            } else {
-              agent = await makeProxyAgent(proxyUrl);
-              if (agent) this._log(index, 'debug', `🛡️ Proxy: ${proxyUrl.replace(/\/\/[^@]+@/, '//*:****@')}`);
-            }
-          } catch (_) {
-            try { agent = await makeProxyAgent(proxyUrl); } catch (_) {}
+        try {
+          let acquired = null;
+          for (let t = 0; t <= 5; t++) {
+            const a = await this.proxyRotator.acquire();
+            if (!a.proxyUrl) { acquired = a; break; }
+            let banned = false;
+            try { const u = new URL(a.proxyUrl); if (isIpBanned(u.hostname)) banned = true; } catch (_) {}
+            if (!banned) { acquired = a; break; }
+            this._log(index, 'warning', 'Proxy IP banned, trying next...');
+            a.release();
           }
+          if (acquired && acquired.proxyUrl) {
+            _proxyRelease = acquired.release;
+            try {
+              agent = await makeProxyAgent(acquired.proxyUrl);
+              if (agent) this._log(index, 'debug', 'Proxy: ' + acquired.proxyUrl.replace(/\/\/[^@]+@/, '//*:****@'));
+              else this._log(index, 'warning', 'Proxy agent failed - using direct');
+            } catch (err) {
+              this._log(index, 'warning', 'Proxy error: ' + err.message);
+            }
+          } else {
+            this._log(index, 'warning', 'All tried proxies banned - using direct');
+          }
+        } catch (proxyErr) {
+          this._log(index, 'warning', 'Proxy acquire failed: ' + proxyErr.message);
         }
       }
 
