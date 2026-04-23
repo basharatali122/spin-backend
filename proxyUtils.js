@@ -192,8 +192,8 @@ async function testProxy(proxyUrl) {
   const user      = decodeURIComponent(parsed.username || '');
   const pass      = decodeURIComponent(parsed.password || '');
 
-  const TARGET_HOST = 'pandamaster.vip';
-  const TARGET_PORT = 7878;
+  const TARGET_HOST = '47.251.75.73';
+  const TARGET_PORT = 8600;
   const TIMEOUT_MS  = 12000;
 
   try {

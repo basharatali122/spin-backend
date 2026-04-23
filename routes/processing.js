@@ -208,7 +208,7 @@ router.post('/:profile/start', async (req, res) => {
     } else if (gameId === 'milkyway') {
       defaultWorkers = 25;
     } else if (gameId === 'megaspin' || gameId === 'orion' || gameId === 'firekirin') {
-      defaultWorkers = 30; // these servers are more permissive
+      defaultWorkers = 15; // these servers are more permissive
     }
 
     // Allow frontend to override, but cap at 50 to prevent OOM

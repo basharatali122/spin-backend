@@ -243,11 +243,10 @@ class WeekendWheelProcessor extends EventEmitter {
     }
 
     if (!result.success && attempt < this.config.RETRY_ATTEMPTS) {
-        // FIX: Exponential backoff with jitter before retry
+        // Exponential backoff with jitter before retry
         const backoffMs = (this.config.RETRY_BACKOFF[attempt] || 8000) + Math.floor(Math.random() * 500);
         this._log(globalIndex, 'warning', `🔄 Retry ${attempt + 1}/${this.config.RETRY_ATTEMPTS} (waiting ${backoffMs}ms)`);
         await this._sleep(backoffMs);
-      await this._sleep(this._rand(500, 1200));
       return this._processWithRetry(account, globalIndex, attempt + 1);
     }
 
@@ -303,7 +302,7 @@ class WeekendWheelProcessor extends EventEmitter {
         resolve(result);
       };
 
-      // ── Proxy selection (same logic as regular processor) ──────────────────
+      // ── Proxy selection — SECURITY: abort if proxy fails, never expose server IP ──
       let agent = null;
       let _proxyRelease = null;
 
@@ -323,16 +322,23 @@ class WeekendWheelProcessor extends EventEmitter {
             _proxyRelease = acquired.release;
             try {
               agent = await makeProxyAgent(acquired.proxyUrl);
-              if (agent) this._log(index, 'debug', 'Proxy: ' + acquired.proxyUrl.replace(/\/\/[^@]+@/, '//*:****@'));
-              else this._log(index, 'warning', 'Proxy agent failed - using direct');
+              if (agent) {
+                this._log(index, 'debug', 'Proxy: ' + acquired.proxyUrl.replace(/\/\/[^@]+@/, '//*:****@'));
+              } else {
+                this._log(index, 'error', '❌ Proxy agent failed — aborting (IP protection)');
+                return done({ success: false, error: 'Proxy agent failed', regularSpun: false, weekendSpun: false, totalScoreWon: 0 });
+              }
             } catch (err) {
-              this._log(index, 'warning', 'Proxy error: ' + err.message);
+              this._log(index, 'error', '❌ Proxy error: ' + err.message + ' — aborting (IP protection)');
+              return done({ success: false, error: 'Proxy error: ' + err.message, regularSpun: false, weekendSpun: false, totalScoreWon: 0 });
             }
           } else {
-            this._log(index, 'warning', 'All tried proxies banned - using direct');
+            this._log(index, 'error', '❌ All proxies banned — aborting (IP protection)');
+            return done({ success: false, error: 'All proxies banned', regularSpun: false, weekendSpun: false, totalScoreWon: 0 });
           }
         } catch (proxyErr) {
-          this._log(index, 'warning', 'Proxy acquire failed: ' + proxyErr.message);
+          this._log(index, 'error', '❌ Proxy acquire failed: ' + proxyErr.message + ' — aborting (IP protection)');
+          return done({ success: false, error: 'Proxy acquire failed: ' + proxyErr.message, regularSpun: false, weekendSpun: false, totalScoreWon: 0 });
         }
       }
 
@@ -374,7 +380,7 @@ class WeekendWheelProcessor extends EventEmitter {
           }
 
           if (!d.userid || !d.dynamicpass) {
-            const serverRejected = d.result === 3 || d.result === 2;
+            const serverRejected = d.result !== 0;
             this._log(index, 'error', `❌ Login failed — result=${d.result} msg="${d.msg || ''}"`);
             return done({ success: false, serverRejected, error: `Login rejected (result:${d.result})`, regularSpun, weekendSpun, totalScoreWon });
           }
