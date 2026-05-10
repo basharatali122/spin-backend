@@ -48,15 +48,15 @@
 //     };
 
 //     this.config = {
-//       LOGIN_WS_URL:   'wss://pandamaster.vip:7878/',
+//       LOGIN_WS_URL:   'ws://47.251.75.73:8600/',
 //       GAME_VERSION:   '2.0.1',
-//       ORIGIN:         'http://play.pandamaster.vip',
+//       ORIGIN:         'http://okay.jkgame.vip',
 
 //       // Worker pool size — tune based on proxy count
 //       // Rule: WORKERS ≤ proxy_count to ensure 1 proxy per concurrent worker
 //       // With 500 proxies @ 3000 concurrent limit: safe to run 50-200 workers
 //       // Each worker uses 1 proxy slot. 50 workers = 10% of proxy pool used.
-//       WORKERS:        50,
+//       WORKERS:        33,
 
 //       // 1 connection per proxy IP = zero saturation risk
 //       PER_PROXY_LIMIT: 1,
@@ -65,7 +65,7 @@
 //       STAGGER_MS:     500,
 
 //       // Only retry on connection/timeout errors — NOT on server rejections
-//       RETRY_ATTEMPTS: 3,
+//       RETRY_ATTEMPTS: 1,
 //       // FIX: Exponential backoff between retries (ms)
 //       RETRY_BACKOFF: [1000, 3000, 8000],
 
@@ -245,6 +245,11 @@
 //       let lotteryscore = 0;
 //       let lastScore    = account.score || 0;
 
+//       // MegaSpin requires subID:11 (game-list handshake) after login
+//       // before the server responds to subID:26 (lottery check).
+//       // All other games go straight from login → subID:26.
+//       const isMegaSpin = this.config.LOGIN_WS_URL.includes('47.251.75.73');
+
 //       this._log(index, 'info', `🔄 ${account.username}${attempt > 0 ? ` (retry ${attempt})` : ''}`);
 
 //       const hardTimeout = setTimeout(() => {
@@ -380,6 +385,22 @@
 //           loginDone           = true;
 //           this._log(index, 'success', `✅ Logged in: ${d.nickname || account.username} | score: ${lastScore}`);
 
+//           if (isMegaSpin) {
+//             // MegaSpin REQUIRES subID:11 (game-list) before subID:26 will respond.
+//             phase = 'gamelist';
+//             ws.send(JSON.stringify({ userid: account.userid, mainID: 100, subID: 11 }));
+//           } else {
+//             phase = 'check';
+//             ws.send(JSON.stringify({
+//               userid: account.userid, password: account.password,
+//               mainID: 100, subID: 26,
+//             }));
+//           }
+//         }
+
+//         // ── MegaSpin: game-list response → proceed to lottery check ───────────
+//         if (msg.subID === 122 && phase === 'gamelist') {
+//           this._log(index, 'debug', `🎮 Game list received — proceeding to lottery check`);
 //           phase = 'check';
 //           ws.send(JSON.stringify({
 //             userid: account.userid, password: account.password,
@@ -475,6 +496,9 @@
 
 
 
+
+
+
 const WebSocket    = require('ws');
 const EventEmitter = require('events');
 const { makeProxyAgent, ProxyRotator } = require('./proxyUtils');
@@ -503,6 +527,26 @@ function extractBannedIp(msg) {
   return m ? m[1] : null;
 }
 
+// ── Global worker budget shared across ALL processor instances ──────────────
+// Node.js is single-threaded. Each active worker holds open a WebSocket + proxy
+// tunnel. If 10 users each spawn 33 workers = 330 concurrent sockets → the
+// event loop saturates and EVERYONE slows down or errors out.
+//
+// Solution: a shared counter limits total concurrent workers across ALL users.
+// KVM2 (2 vCPU, 4 GB) sweet spot: 60–80 total concurrent WebSocket workers.
+// Adjust MAX_GLOBAL_WORKERS up if you have faster proxies / more RAM.
+const MAX_GLOBAL_WORKERS = 70;
+let   _globalActiveWorkers = 0;
+
+function _acquireWorkerSlot() {
+  if (_globalActiveWorkers >= MAX_GLOBAL_WORKERS) return false;
+  _globalActiveWorkers++;
+  return true;
+}
+function _releaseWorkerSlot() {
+  if (_globalActiveWorkers > 0) _globalActiveWorkers--;
+}
+
 class RegularWheelProcessor extends EventEmitter {
   constructor(db) {
     super();
@@ -527,11 +571,11 @@ class RegularWheelProcessor extends EventEmitter {
       GAME_VERSION:   '2.0.1',
       ORIGIN:         'http://okay.jkgame.vip',
 
-      // Worker pool size — tune based on proxy count
-      // Rule: WORKERS ≤ proxy_count to ensure 1 proxy per concurrent worker
-      // With 500 proxies @ 3000 concurrent limit: safe to run 50-200 workers
-      // Each worker uses 1 proxy slot. 50 workers = 10% of proxy pool used.
-      WORKERS:        50,
+      // Max workers THIS instance will try to start.
+      // The global slot limiter (MAX_GLOBAL_WORKERS=70) is the hard ceiling
+      // shared across ALL users — so 10 users each requesting 33 workers
+      // will not exceed 70 total. This keeps the event loop healthy.
+      WORKERS:        33,
 
       // 1 connection per proxy IP = zero saturation risk
       PER_PROXY_LIMIT: 1,
@@ -540,7 +584,7 @@ class RegularWheelProcessor extends EventEmitter {
       STAGGER_MS:     500,
 
       // Only retry on connection/timeout errors — NOT on server rejections
-      RETRY_ATTEMPTS: 3,
+      RETRY_ATTEMPTS: 1,
       // FIX: Exponential backoff between retries (ms)
       RETRY_BACKOFF: [1000, 3000, 8000],
 
@@ -619,6 +663,16 @@ class RegularWheelProcessor extends EventEmitter {
         const next = getNext();
         if (!next) break;
 
+        // Wait for a global slot — backs off if server is saturated
+        // This prevents event loop overload when multiple users run at once
+        let waited = 0;
+        while (!_acquireWorkerSlot()) {
+          if (!this.isProcessing) return;
+          await this._sleep(200);
+          waited += 200;
+          if (waited > 30000) break; // give up after 30s, pick next account
+        }
+
         const { account, index } = next;
         this.stats.activeWorkers++;
         this._emit('status', {
@@ -630,6 +684,7 @@ class RegularWheelProcessor extends EventEmitter {
           await this._processWithRetry(account, index);
         } catch (_) {}
 
+        _releaseWorkerSlot();
         this.stats.activeWorkers--;
         this.stats.processed++;
 
@@ -965,3 +1020,5 @@ class RegularWheelProcessor extends EventEmitter {
 }
 
 module.exports = RegularWheelProcessor;
+module.exports._acquireWorkerSlot = _acquireWorkerSlot;
+module.exports._releaseWorkerSlot = _releaseWorkerSlot;
