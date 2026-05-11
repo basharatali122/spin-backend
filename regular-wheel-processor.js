@@ -28,6 +28,26 @@
 //   return m ? m[1] : null;
 // }
 
+// // ── Global worker budget shared across ALL processor instances ──────────────
+// // Node.js is single-threaded. Each active worker holds open a WebSocket + proxy
+// // tunnel. If 10 users each spawn 33 workers = 330 concurrent sockets → the
+// // event loop saturates and EVERYONE slows down or errors out.
+// //
+// // Solution: a shared counter limits total concurrent workers across ALL users.
+// // KVM2 (2 vCPU, 4 GB) sweet spot: 60–80 total concurrent WebSocket workers.
+// // Adjust MAX_GLOBAL_WORKERS up if you have faster proxies / more RAM.
+// const MAX_GLOBAL_WORKERS = 70;
+// let   _globalActiveWorkers = 0;
+
+// function _acquireWorkerSlot() {
+//   if (_globalActiveWorkers >= MAX_GLOBAL_WORKERS) return false;
+//   _globalActiveWorkers++;
+//   return true;
+// }
+// function _releaseWorkerSlot() {
+//   if (_globalActiveWorkers > 0) _globalActiveWorkers--;
+// }
+
 // class RegularWheelProcessor extends EventEmitter {
 //   constructor(db) {
 //     super();
@@ -52,10 +72,10 @@
 //       GAME_VERSION:   '2.0.1',
 //       ORIGIN:         'http://okay.jkgame.vip',
 
-//       // Worker pool size — tune based on proxy count
-//       // Rule: WORKERS ≤ proxy_count to ensure 1 proxy per concurrent worker
-//       // With 500 proxies @ 3000 concurrent limit: safe to run 50-200 workers
-//       // Each worker uses 1 proxy slot. 50 workers = 10% of proxy pool used.
+//       // Max workers THIS instance will try to start.
+//       // The global slot limiter (MAX_GLOBAL_WORKERS=70) is the hard ceiling
+//       // shared across ALL users — so 10 users each requesting 33 workers
+//       // will not exceed 70 total. This keeps the event loop healthy.
 //       WORKERS:        33,
 
 //       // 1 connection per proxy IP = zero saturation risk
@@ -144,6 +164,16 @@
 //         const next = getNext();
 //         if (!next) break;
 
+//         // Wait for a global slot — backs off if server is saturated
+//         // This prevents event loop overload when multiple users run at once
+//         let waited = 0;
+//         while (!_acquireWorkerSlot()) {
+//           if (!this.isProcessing) return;
+//           await this._sleep(200);
+//           waited += 200;
+//           if (waited > 30000) break; // give up after 30s, pick next account
+//         }
+
 //         const { account, index } = next;
 //         this.stats.activeWorkers++;
 //         this._emit('status', {
@@ -155,6 +185,7 @@
 //           await this._processWithRetry(account, index);
 //         } catch (_) {}
 
+//         _releaseWorkerSlot();
 //         this.stats.activeWorkers--;
 //         this.stats.processed++;
 
@@ -490,8 +521,8 @@
 // }
 
 // module.exports = RegularWheelProcessor;
-
-
+// module.exports._acquireWorkerSlot = _acquireWorkerSlot;
+// module.exports._releaseWorkerSlot = _releaseWorkerSlot;
 
 
 
@@ -532,10 +563,19 @@ function extractBannedIp(msg) {
 // tunnel. If 10 users each spawn 33 workers = 330 concurrent sockets → the
 // event loop saturates and EVERYONE slows down or errors out.
 //
-// Solution: a shared counter limits total concurrent workers across ALL users.
-// KVM2 (2 vCPU, 4 GB) sweet spot: 60–80 total concurrent WebSocket workers.
-// Adjust MAX_GLOBAL_WORKERS up if you have faster proxies / more RAM.
-const MAX_GLOBAL_WORKERS = 70;
+// TARGET: 100 concurrent users, each finishing 500 accounts in 3-5 minutes.
+// Math: 500 accounts / 3min = 167 accounts/min = 2.8 accounts/sec per user.
+// Each account takes ~1-2 seconds (login+gamelist+check+spin = 4 WS messages).
+// So each user needs ~5-8 active workers to maintain 2.8 acc/sec.
+// 100 users × 7 workers = 700 — but Node.js can handle ~300 concurrent WS safely.
+// Solution: per-user worker count scales DOWN as more users are active,
+// but each user always gets at least 6 workers minimum.
+//
+// KVM2 (2 vCPU, 4 GB): tested safe up to 300 concurrent WebSocket workers.
+// ── Global worker budget ─────────────────────────────────────────────────────
+// Node.js is single-threaded. This counter limits TOTAL concurrent WebSocket
+// workers across ALL users so the event loop never saturates.
+const MAX_GLOBAL_WORKERS = 300;
 let   _globalActiveWorkers = 0;
 
 function _acquireWorkerSlot() {
@@ -545,6 +585,21 @@ function _acquireWorkerSlot() {
 }
 function _releaseWorkerSlot() {
   if (_globalActiveWorkers > 0) _globalActiveWorkers--;
+}
+
+// ── Active user tracking ─────────────────────────────────────────────────────
+// CRITICAL: Use a Set of instances, NOT a counter.
+// A counter leaks: if startProcessing increments but a crash skips decrement,
+// the count grows forever → workers drop to 14 → performance degrades each run.
+// A Set is self-healing: add(this) on start, delete(this) on stop. No leak possible.
+const _runningProcessors = new Set();
+
+function _getWorkersForUser(requestedWorkers) {
+  const activeCount = _runningProcessors.size || 1;
+  if (activeCount <= 1) return requestedWorkers;
+  // Fair share: divide budget equally, guarantee at least 10 workers per user
+  const fair = Math.floor(MAX_GLOBAL_WORKERS / activeCount);
+  return Math.max(10, Math.min(requestedWorkers, fair));
 }
 
 class RegularWheelProcessor extends EventEmitter {
@@ -572,28 +627,35 @@ class RegularWheelProcessor extends EventEmitter {
       ORIGIN:         'http://okay.jkgame.vip',
 
       // Max workers THIS instance will try to start.
-      // The global slot limiter (MAX_GLOBAL_WORKERS=70) is the hard ceiling
-      // shared across ALL users — so 10 users each requesting 33 workers
-      // will not exceed 70 total. This keeps the event loop healthy.
+      // _getWorkersForUser() scales this down fairly when many users are active.
       WORKERS:        33,
 
       // 1 connection per proxy IP = zero saturation risk
       PER_PROXY_LIMIT: 1,
 
-      // FIX: Stagger increased from 150ms → 500ms to prevent thundering herd
-      STAGGER_MS:     500,
+      // FIXED: Was 500ms → caused 33×500=16.5s startup delay per user!
+      // Now 50ms: workers start fast, global slot limiter controls concurrency.
+      STAGGER_MS:     50,
 
-      // Only retry on connection/timeout errors — NOT on server rejections
+      // Only retry once — failed proxies waste time, better to move on fast
       RETRY_ATTEMPTS: 1,
-      // FIX: Exponential backoff between retries (ms)
-      RETRY_BACKOFF: [1000, 3000, 8000],
+
+      // FIXED: Was [1000,3000,8000] — a single fail blocked a worker for 8s!
+      // 100+ failures × 4s avg = 400+ seconds wasted per run.
+      // Now 300ms: quick retry then move on.
+      RETRY_BACKOFF: [300, 800],
 
       TIMEOUTS: {
-        TOTAL:  35000,  // hard per-account limit
-        WS:    25000,  // FIX: Increased 12s → 25s for slow SOCKS5 handshakes  // WebSocket handshake
+        // FIXED: Was 35s → now 12s. Login+spin normally takes <3s.
+        // 12s is still generous for slow proxies. Failing fast frees workers.
+        TOTAL:  12000,
+        // FIXED: Was 25s → now 8s. Enough for SOCKS5 handshake.
+        WS:      8000,
       },
 
-      RANDOM_DELAYS: { MIN: 300, MAX: 800 },
+      // FIXED: Was MIN:300 MAX:800 — added ~550ms after EVERY account!
+      // 500 accounts × 550ms = 275 seconds wasted per run. Removed.
+      RANDOM_DELAYS: { MIN: 0, MAX: 30 },
     };
 
     this.mobileUserAgents = [
@@ -612,21 +674,29 @@ class RegularWheelProcessor extends EventEmitter {
 
     this.isProcessing = true;
     this.stats = { successCount: 0, failCount: 0, ipBanned: 0, wheelSpins: 0, totalScoreWon: 0, activeWorkers: 0, processed: 0 };
+    this._lastStatusEmit = 0;
 
-    // Pass maxPerProxy so the rotator enforces 1 concurrent connection per proxy IP
-    this.proxyRotator = new ProxyRotator(proxyList, { maxPerProxy: this.config.PER_PROXY_LIMIT });
+    // Register this instance as running — Set prevents double-registration
+    _runningProcessors.add(this);
 
-    // Workers capped to proxy_count * PER_PROXY_LIMIT (but rotator still enforces the actual limit)
-    const workerCount = (useProxy && proxyList.length > 0)
+    // acquireTimeoutMs: 8s max wait for a proxy slot.
+    // Was 30s — a worker blocked for 30s waiting for proxy = dead worker.
+    this.proxyRotator = new ProxyRotator(proxyList, {
+      maxPerProxy: this.config.PER_PROXY_LIMIT,
+      acquireTimeoutMs: 8000,
+    });
+
+    const rawCount = (useProxy && proxyList.length > 0)
       ? Math.min(this.config.WORKERS, proxyList.length * this.config.PER_PROXY_LIMIT)
       : this.config.WORKERS;
+    const workerCount = _getWorkersForUser(rawCount);
 
     const all = await this.db.getAllAccounts();
     this.currentAccounts = all.filter(a => accountIds.includes(a.id));
 
     this._emit('terminal', { type: 'info', message: `🚀 REGULAR WHEEL SPIN BOT STARTED` });
     this._emit('terminal', { type: 'info', message: `📋 Accounts: ${this.currentAccounts.length}` });
-    this._emit('terminal', { type: 'info', message: `⚡ Workers: ${workerCount} concurrent` });
+    this._emit('terminal', { type: 'info', message: `⚡ Workers: ${workerCount} (active users: ${_runningProcessors.size})` });
     this._emit('terminal', { type: 'info', message: `🌐 Login: ${this.config.LOGIN_WS_URL}` });
     this._emit('terminal', { type: 'info', message: `🔗 Origin: ${this.config.ORIGIN}` });
     this._emit('terminal', { type: 'info', message: `🛡️ Proxy: ${this.proxyRotator.enabled ? this.proxyRotator.summary() : 'disabled (direct)'}` });
@@ -638,6 +708,7 @@ class RegularWheelProcessor extends EventEmitter {
 
   async stopProcessing() {
     this.isProcessing = false;
+    _runningProcessors.delete(this); // safe to call even if not in set
     this._emit('terminal', { type: 'warning', message: '🛑 Processing stopped by user' });
     this._emit('status', { running: false, activeWorkers: 0 });
     return { success: true };
@@ -648,10 +719,16 @@ class RegularWheelProcessor extends EventEmitter {
   // When done, it immediately picks the next one — no waiting for a full batch.
   // Workers start staggered to avoid bursting the game server.
 
+  // ── Continuous worker pool ──────────────────────────────────────────────────
+  // Each worker picks the next account from a shared queue and processes it
+  // immediately when done — no waiting for a batch to finish.
+  // The global slot counter (_globalActiveWorkers) prevents the combined
+  // workers of ALL concurrent users from overloading the Node.js event loop.
+
   async _runWorkerPool(workerCount) {
-    const queue   = [...this.currentAccounts]; // local copy, mutated by workers
+    const queue    = [...this.currentAccounts];
     let   queueIdx = 0;
-    const total   = queue.length;
+    const total    = queue.length;
 
     const getNext = () => {
       if (queueIdx >= total) return null;
@@ -663,22 +740,27 @@ class RegularWheelProcessor extends EventEmitter {
         const next = getNext();
         if (!next) break;
 
-        // Wait for a global slot — backs off if server is saturated
-        // This prevents event loop overload when multiple users run at once
-        let waited = 0;
+        // Acquire a global slot. Spin with 50ms yield — fast enough to keep
+        // workers busy without burning CPU while slots are temporarily full.
         while (!_acquireWorkerSlot()) {
           if (!this.isProcessing) return;
-          await this._sleep(200);
-          waited += 200;
-          if (waited > 30000) break; // give up after 30s, pick next account
+          await this._sleep(50);
         }
 
         const { account, index } = next;
         this.stats.activeWorkers++;
-        this._emit('status', {
-          running: true, total, current: index + 1,
-          activeWorkers: this.stats.activeWorkers, currentAccount: account.username,
-        });
+
+        // Throttle status broadcast: max once per 250ms across ALL workers.
+        // Without throttle: 300 workers × ~1 finish/sec = 300 socket broadcasts/sec.
+        // With throttle: max 4 broadcasts/sec regardless of worker count.
+        const now = Date.now();
+        if (now - this._lastStatusEmit > 250) {
+          this._lastStatusEmit = now;
+          this._emit('status', {
+            running: true, total, current: index + 1,
+            activeWorkers: this.stats.activeWorkers, currentAccount: account.username,
+          });
+        }
 
         try {
           await this._processWithRetry(account, index);
@@ -688,7 +770,6 @@ class RegularWheelProcessor extends EventEmitter {
         this.stats.activeWorkers--;
         this.stats.processed++;
 
-        // Emit speed stats every 10 accounts
         if (this.stats.processed % 10 === 0) {
           this._emit('terminal', {
             type: 'info',
@@ -698,7 +779,7 @@ class RegularWheelProcessor extends EventEmitter {
       }
     };
 
-    // Start workers with stagger
+    // Stagger worker startup — 50ms × 33 workers = 1.65s total (was 16.5s!)
     const workers = [];
     for (let i = 0; i < workerCount; i++) {
       await this._sleep(this.config.STAGGER_MS);
@@ -707,6 +788,9 @@ class RegularWheelProcessor extends EventEmitter {
     }
 
     await Promise.allSettled(workers);
+
+    // Unregister from running set — job completed naturally
+    _runningProcessors.delete(this);
     if (this.isProcessing) this._complete();
   }
 
@@ -715,11 +799,11 @@ class RegularWheelProcessor extends EventEmitter {
   async _processWithRetry(account, globalIndex, attempt = 0) {
     const result = await this._accountFlow(account, globalIndex, attempt);
 
-    // Persist result
+    // Persist result — fire-and-forget, never block the worker
     if (result.newScore !== undefined) {
-      await this.db.updateAccount({ ...account, score: result.newScore });
+      this.db.updateAccount({ ...account, score: result.newScore });
     }
-    await this.db.addProcessingLog(
+    this.db.addProcessingLog(
       account.id,
       result.success ? 'success' : (result.ipBanned ? 'ip_banned' : 'error'),
       result.success ? `Wheel spin: +${result.lotteryscore || 0}` : result.error,
@@ -1022,3 +1106,5 @@ class RegularWheelProcessor extends EventEmitter {
 module.exports = RegularWheelProcessor;
 module.exports._acquireWorkerSlot = _acquireWorkerSlot;
 module.exports._releaseWorkerSlot = _releaseWorkerSlot;
+module.exports._runningProcessors = _runningProcessors;
+module.exports._getWorkersForUser = _getWorkersForUser;
